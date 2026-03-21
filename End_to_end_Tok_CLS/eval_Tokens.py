@@ -2,9 +2,9 @@
 # !export LD_LIBRARY_PATH=/YOUR_HOME/miniconda3/envs/gnn/lib:$LD_LIBRARY_PATH
 
 import os,sys,re
+import json
 import argparse
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import EsmForTokenClassification
 from transformers import AutoTokenizer, DataCollatorForTokenClassification
 
-from train_Tokens import MyDataset
+from train_Tokens import MyDataset, compute_binary_metrics
 
 os.environ['NCCL_P2P_DISABLE'] = '1'
 os.environ['NCCL_IB_DISABLE'] = '1'
@@ -44,7 +44,7 @@ def get_parameters():
     parser.add_argument('--batch_size', type=int, default=32, help='input batch size for training. (default: 4)')
     parser.add_argument('--max_len', type=int, default=300, help='Max sequence length. (default: 300)')
     parser.add_argument('--min_seg_len', type=int, default=5, help='Minimum segament length. (default: 5)')
-    parser.add_argument('--model_name', type=str, default='model_weights/Tok_CLS/epoch10' , help='YOUR_MODEL_PATH.')
+    parser.add_argument('--model_name', type=str, default='model_weights/Tok_CLS/epoch10' , help='Checkpoint path, training output directory, or best_model_info.json path.')
     args = parser.parse_args()
     return args
 
@@ -83,43 +83,75 @@ def process_preds_and_labs(preds,labs,min_seg_len):
         labs_tags.append(token2seq_lab(labs[i][labs[i]!=-100], min_seg_len)[0])
     return preds_tags, labs_tags
 
-def compute_metrics(preds, labs):
-    return {
-        "accuracy": accuracy_score(labs, preds),
-        "f1": f1_score(labs, preds, zero_division=0),
-        "precision": precision_score(labs, preds, zero_division=0),
-        "recall": recall_score(labs, preds, zero_division=0),
+def compute_metrics(preds, labs, probs=None):
+    preds = np.asarray(preds)
+    labs = np.asarray(labs)
+    probs = None if probs is None else np.asarray(probs)
+    return compute_binary_metrics(labs, preds, probs=probs)
+
+
+def load_json_if_exists(path):
+    if path and os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+def find_training_args_file(model_name, resolved_model_name):
+    candidates = []
+    for candidate in [model_name, resolved_model_name]:
+        if not candidate:
+            continue
+        if os.path.isfile(candidate):
+            candidates.append(os.path.join(os.path.dirname(candidate), 'training_args.json'))
+        if os.path.isdir(candidate):
+            candidates.append(os.path.join(candidate, 'training_args.json'))
+            candidates.append(os.path.join(os.path.dirname(candidate.rstrip('/')), 'training_args.json'))
+            best_model_info_path = os.path.join(candidate, 'best_model_info.json')
+            if os.path.exists(best_model_info_path):
+                best_model_info = load_json_if_exists(best_model_info_path)
+                if best_model_info is not None:
+                    candidates.append(best_model_info.get('training_args_file'))
+                    candidates.append(os.path.join(best_model_info.get('output_dir', candidate), 'training_args.json'))
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def build_result_payload(model_name, resolved_model_name, training_args_file, training_args, protein_metrics, token_metrics):
+    payload = {
+        'model_name': model_name,
+        'resolved_model_name': resolved_model_name,
+        'training_args_file': training_args_file,
+        'training_args': training_args,
+        'protein_level': protein_metrics,
+        'token_level': token_metrics,
     }
+    payload.update(token_metrics)
+    return payload
 
-def compute_roc_auc(probs, labs):
-    try:
-        return {"roc_auc": roc_auc_score(labs, probs)}
-    except ValueError:
-        return {"roc_auc": 0.0}
+def resolve_model_path(model_name):
+    if os.path.isfile(model_name) and model_name.endswith('.json'):
+        with open(model_name, 'r', encoding='utf-8') as f:
+            model_info = json.load(f)
+        return model_info.get('best_model_checkpoint', model_info.get('output_dir', model_name))
 
-def report_pred(preds, labs):
-    positives, negatives = 0, 0 
-    tp, fp, tn, fn = 0, 0, 0, 0
-    for i in range(len(preds)):
-        if labs[i] == 1:
-            positives += 1
-            if preds[i] == labs[i]:
-                tp += 1
-            else:
-                fn += 1
-        else:
-            negatives += 1
-            if preds[i] == labs[i]:
-                tn += 1
-            else:
-                fp += 1
-    return {'Total': positives+negatives , 'Positive': positives, 'Negative': negatives, 'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn}
+    best_model_info_path = os.path.join(model_name, 'best_model_info.json')
+    if os.path.isdir(model_name) and os.path.exists(best_model_info_path):
+        with open(best_model_info_path, 'r', encoding='utf-8') as f:
+            model_info = json.load(f)
+        return model_info.get('best_model_checkpoint', model_name)
+
+    return model_name
+
 
 ## prepare model
 def get_model(model_name):
-    print('Loading model from: %s' % model_name)
-    model = EsmForTokenClassification.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    resolved_model_name = resolve_model_path(model_name)
+    print('Loading model from: %s' % resolved_model_name)
+    model = EsmForTokenClassification.from_pretrained(resolved_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
     return model, tokenizer
 
 def prepare_dataset(data_path, label_path, tokenizer, max_len, batch_size, data_type='val'):
@@ -171,48 +203,52 @@ def eval_data(dataloader, model, min_amp_len):
             all_token_labs += labs.tolist()
             all_token_probs += probs.tolist()
     
-    ## Protein-level    
-    metrics_rep = compute_metrics(all_preds,all_labs)
-    reports = report_pred(all_preds,all_labs)
+    ## Protein-level
+    metrics_rep = compute_metrics(all_preds, all_labs)
     ## Token-level
-    metrics_rep_tok = compute_metrics(all_token_preds,all_token_labs)
-    # auc_rep_tok = compute_roc_auc(all_token_probs, all_token_labs)
-    reports_tok = report_pred(all_token_preds,all_token_labs)   
-    
-    # return metrics_rep, reports, metrics_rep_tok | auc_rep_tok, reports_tok
-    return metrics_rep, reports, metrics_rep_tok, reports_tok
+    metrics_rep_tok = compute_metrics(all_token_preds, all_token_labs, probs=all_token_probs)
+    return metrics_rep, metrics_rep_tok
 
 ## main function
 
 def main():
     args = get_parameters()
     model, tokenizer = get_model(args.model_name)
-    
+
+    os.makedirs(args.outdir, exist_ok=True)
+    resolved_model_name = resolve_model_path(args.model_name)
+    training_args_file = find_training_args_file(args.model_name, resolved_model_name)
+    training_args = load_json_if_exists(training_args_file)
     with open(os.path.join(args.outdir, 'eval_metrics.txt'), 'a') as mtx:
-        mtx.write('Evaluation on model: %s\n' % args.model_name.split('/')[-1])
+        mtx.write('Evaluation on model: %s\n' % os.path.basename(resolved_model_name.rstrip('/')))
         ## val dataset
         # val_dataloader = prepare_dataset(args.data_path, args.label_path,
         #                                 tokenizer, args.max_len, args.batch_size, data_type='test')
-        # val_metrics, val_reports, val_metrics_tok, val_reports_tok = eval_data(val_dataloader, model, args.min_seg_len)
+        # val_metrics, val_metrics_tok = eval_data(val_dataloader, model, args.min_seg_len)
         # mtx.write('Performance on val_dataset (Protein-level):\n')
         # mtx.write(str(val_metrics)+'\n')
-        # mtx.write(str(val_reports)+'\n')
         # mtx.write('Performance on val_dataset (Token-level):\n')
         # mtx.write(str(val_metrics_tok)+'\n')
-        # mtx.write(str(val_reports_tok)+'\n')
         
         ## test dataset
         test_dataloader = prepare_dataset(args.data_path, args.label_path,
                                         tokenizer, args.max_len, args.batch_size, data_type='test')
-        test_metrics, test_reports, test_metrics_tok, test_reports_tok = eval_data(test_dataloader, model, args.min_seg_len)
+        test_metrics, test_metrics_tok = eval_data(test_dataloader, model, args.min_seg_len)
         mtx.write('Performance on test_dataset (Protein-level):\n')
         mtx.write(str(test_metrics)+'\n')
-        mtx.write(str(test_reports)+'\n')
         mtx.write('Performance on test_dataset (Token-level):\n')
         mtx.write(str(test_metrics_tok)+'\n')
-        mtx.write(str(test_reports_tok)+'\n')
         mtx.write('\n')
         mtx.write('\n')
+
+    test_results_payload = build_result_payload(args.model_name, resolved_model_name, training_args_file, training_args, test_metrics, test_metrics_tok)
+    with open(os.path.join(args.outdir, 'test_results.json'), 'w', encoding='utf-8') as f:
+        json.dump(test_results_payload, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(args.outdir, 'protein_level_test_results.json'), 'w', encoding='utf-8') as f:
+        json.dump(test_metrics, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(args.outdir, 'token_level_test_results.json'), 'w', encoding='utf-8') as f:
+        json.dump(test_metrics_tok, f, indent=2, ensure_ascii=False)
+    print('Saved evaluation summary to: %s' % os.path.join(args.outdir, 'test_results.json'))
     
             
             
