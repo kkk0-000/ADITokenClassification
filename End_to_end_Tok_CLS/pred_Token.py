@@ -1,4 +1,5 @@
 import os,sys,re
+import json
 import argparse
 import numpy as np
 import pandas as pd
@@ -54,16 +55,32 @@ def get_parameters():
     parser.add_argument('--output','-o', type=str, default='./out_prediction.tsv', help='YOUR OUTPUT predictions.')
     parser.add_argument('--batch_size', type=int, default=4, help='input batch size for training. (default: 4)')
     parser.add_argument('--max_len', type=int, default=300, help='Max sequence length. (default: 300)')
-    parser.add_argument('--model_name', type=str, default='model_weights/Tok_CLS/epoch15' , help='YOUR_MODEL_PATH.')
+    parser.add_argument('--model_name', type=str, default='model_weights/Tok_CLS/epoch15' , help='Checkpoint path, training output directory, or best_model_info.json path.')
     parser.add_argument('--num_classes', type=int, default=2)
     args = parser.parse_args()
     return args
 
+def resolve_model_path(model_name):
+    if os.path.isfile(model_name) and model_name.endswith('.json'):
+        with open(model_name, 'r', encoding='utf-8') as f:
+            model_info = json.load(f)
+        return model_info.get('best_model_checkpoint', model_info.get('output_dir', model_name))
+
+    best_model_info_path = os.path.join(model_name, 'best_model_info.json')
+    if os.path.isdir(model_name) and os.path.exists(best_model_info_path):
+        with open(best_model_info_path, 'r', encoding='utf-8') as f:
+            model_info = json.load(f)
+        return model_info.get('best_model_checkpoint', model_name)
+
+    return model_name
+
+
 ## prepare model
 def get_model(model_name):
-    print('Loading model from: %s' % model_name)
-    model = EsmForTokenClassification.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    resolved_model_name = resolve_model_path(model_name)
+    print('Loading model from: %s' % resolved_model_name)
+    model = EsmForTokenClassification.from_pretrained(resolved_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
     return model, tokenizer
 
 def prepare_dataset(input_csv, tokenizer, max_len, batch_size):

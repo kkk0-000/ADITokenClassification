@@ -13,10 +13,11 @@ Launch examples:
 """
 
 import os, sys, re
+import json
 import argparse
 import random
 import numpy as np
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, precision_score, recall_score, roc_auc_score
 import pandas as pd
 import torch
 import datasets
@@ -25,11 +26,15 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset
 from transformers import EsmForTokenClassification
-from transformers import AutoTokenizer, TrainingArguments, Trainer
+from transformers import AutoTokenizer, EarlyStoppingCallback, TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
 
 os.environ['NCCL_P2P_DISABLE'] = '1'
 os.environ['NCCL_IB_DISABLE'] = '1'
+
+TRAINING_HISTORY_FILENAME = 'training_history.json'
+TRAINING_SUMMARY_FILENAME = 'training_summary.json'
+METRIC_KEYS = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'mcc', 'specificity', 'tp', 'tn', 'fp', 'fn']
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +109,8 @@ class MultilabelTrainer(Trainer):
         self.pos_weight = pos_weight
         self.focal_gamma = focal_gamma
         self.num_labels = num_labels
+        self.training_history = []
+        self._collecting_train_statistics = False
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")  # (batch, seq_len, num_labels)
@@ -134,6 +141,42 @@ class MultilabelTrainer(Trainer):
             loss = F.binary_cross_entropy_with_logits(logits_valid, labels_valid)
 
         return (loss, outputs) if return_outputs else loss
+
+    def _evaluate_train_split(self, ignore_keys=None):
+        self._collecting_train_statistics = True
+        try:
+            return super().evaluate(
+                eval_dataset=self.train_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix='train',
+            )
+        finally:
+            self._collecting_train_statistics = False
+
+    def _record_training_history(self, eval_metrics, train_metrics):
+        history_entry = {
+            'epoch': find_latest_epoch(self.state.log_history, default_epoch=self.state.epoch),
+            'train_loss': to_serializable_value(train_metrics.get('train_loss', find_latest_training_loss(self.state.log_history))),
+            'train_metrics': extract_metric_payload(train_metrics, 'train'),
+            'val_loss': to_serializable_value(eval_metrics.get('eval_loss')),
+            'val_metrics': extract_metric_payload(eval_metrics, 'eval'),
+        }
+        self.training_history.append(history_entry)
+        if self.is_world_process_zero():
+            save_json_file(os.path.join(self.args.output_dir, TRAINING_HISTORY_FILENAME), self.training_history)
+            save_training_summary(self.args.output_dir, self.training_history)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix='eval'):
+        metrics = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+        should_collect_history = (
+            metric_key_prefix == 'eval'
+            and not self._collecting_train_statistics
+            and self.train_dataset is not None
+        )
+        if should_collect_history:
+            train_metrics = self._evaluate_train_split(ignore_keys=ignore_keys)
+            self._record_training_history(metrics, train_metrics)
+        return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +284,114 @@ def compute_pos_weights(dataset_obj, num_labels):
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def safe_roc_auc(labels, probs):
+    try:
+        return roc_auc_score(labels, probs)
+    except ValueError:
+        return 0.0
+
+
+def compute_binary_metrics(labels, preds, probs):
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    return {
+        'accuracy': accuracy_score(labels, preds),
+        'precision': precision_score(labels, preds, zero_division=0),
+        'recall': recall_score(labels, preds, zero_division=0),
+        'f1': f1_score(labels, preds, zero_division=0),
+        'auc': safe_roc_auc(labels, probs),
+        'mcc': matthews_corrcoef(labels, preds) if len(np.unique(labels)) > 1 and len(np.unique(preds)) > 1 else 0.0,
+        'specificity': specificity,
+        'tp': int(tp),
+        'tn': int(tn),
+        'fp': int(fp),
+        'fn': int(fn),
+    }
+
+
+def save_best_model_info(trainer, output_dir):
+    best_model_info = {
+        'output_dir': output_dir,
+        'best_model_checkpoint': trainer.state.best_model_checkpoint,
+        'best_metric': trainer.state.best_metric,
+        'best_global_step': trainer.state.global_step,
+        'num_train_epochs': trainer.args.num_train_epochs,
+        'per_device_train_batch_size': trainer.args.per_device_train_batch_size,
+        'gradient_accumulation_steps': trainer.args.gradient_accumulation_steps,
+        'world_size': trainer.args.world_size,
+        'process_index': trainer.args.process_index,
+        'training_args_file': os.path.join(output_dir, 'training_args.json'),
+        'training_history_file': os.path.join(output_dir, TRAINING_HISTORY_FILENAME),
+        'training_summary_file': os.path.join(output_dir, TRAINING_SUMMARY_FILENAME),
+    }
+    best_model_info_path = os.path.join(output_dir, 'best_model_info.json')
+    with open(best_model_info_path, 'w', encoding='utf-8') as f:
+        json.dump(best_model_info, f, indent=2, ensure_ascii=False)
+    print(f'Saved best model information to: {best_model_info_path}')
+
+
+def to_serializable_value(value):
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        if abs(value - round(value)) < 1e-9:
+            return int(round(value))
+        return float(value)
+    return value
+
+
+def save_json_file(output_path, payload):
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def save_training_args(args, output_dir):
+    training_args_payload = vars(args).copy()
+    training_args_payload['output_dir'] = output_dir
+    training_args_path = os.path.join(output_dir, 'training_args.json')
+    save_json_file(training_args_path, training_args_payload)
+    return training_args_path
+
+
+def extract_metric_payload(metrics, prefix):
+    payload = {}
+    for suffix in METRIC_KEYS:
+        metric_key = f'{prefix}_{suffix}'
+        if metric_key in metrics:
+            value = metrics[metric_key]
+            payload[suffix] = int(value) if suffix in {'tp', 'tn', 'fp', 'fn'} else to_serializable_value(value)
+    return payload
+
+
+def find_latest_epoch(log_history, default_epoch=None):
+    for entry in reversed(log_history):
+        if 'epoch' in entry:
+            return to_serializable_value(entry['epoch'])
+    return to_serializable_value(default_epoch)
+
+
+def find_latest_training_loss(log_history):
+    for entry in reversed(log_history):
+        if 'loss' in entry:
+            return float(entry['loss'])
+    return None
+
+
+def save_training_summary(output_dir, history):
+    if not history:
+        return None
+    best_entry = max(history, key=lambda item: item['val_metrics'].get('f1', 0.0))
+    summary = {
+        'num_epochs': len(history),
+        'best_epoch': best_entry['epoch'],
+        'best_train_loss': best_entry['train_loss'],
+        'best_val_loss': best_entry['val_loss'],
+        'best_val_metrics': best_entry['val_metrics'],
+    }
+    save_json_file(os.path.join(output_dir, TRAINING_SUMMARY_FILENAME), summary)
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
@@ -278,6 +429,12 @@ def get_parameters():
     parser.add_argument('--dataloader_num_workers', type=int, default=4)
     parser.add_argument('--logging_steps', type=int, default=50)
     parser.add_argument('--save_total_limit', type=int, default=3)
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Optional explicit output directory for checkpoints/logs.')
+    parser.add_argument('--early_stopping_patience', type=int, default=0,
+                        help='Early stopping patience in evaluation rounds. Set 0 to disable.')
+    parser.add_argument('--early_stopping_threshold', type=float, default=0.0,
+                        help='Minimum improvement required by early stopping.')
     parser.add_argument('--deepspeed', type=str, default=None)
     parser.add_argument('--local_rank', type=int, default=-1)
     args = parser.parse_args()
@@ -313,6 +470,8 @@ def train_args_prepare(args):
     if args.ft_mode == 'lora':
         folder_name = (f"finetune/{mod_name}-lora-r{args.lora_rank}-Token-multilabel-{args.num_labels}"
                        f"-{args.loss_type}-gamma{args.focal_gamma}-ddp")
+    if args.output_dir:
+        folder_name = args.output_dir
     return TrainingArguments(
         output_dir=folder_name,
         overwrite_output_dir=True,
@@ -325,7 +484,7 @@ def train_args_prepare(args):
         num_train_epochs=args.epochs,
         weight_decay=args.weight_decay,
         load_best_model_at_end=True,
-        metric_for_best_model='f1_macro',
+        metric_for_best_model='f1',
         greater_is_better=True,
         fp16=args.fp16, bf16=args.bf16,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -354,21 +513,7 @@ def compute_metrics(eval_pred):
 
     probs = 1 / (1 + np.exp(-logits_valid))
     preds = (probs > THRESHOLD).astype(int)
-
-    result = {
-        "f1_micro": f1_score(labels_valid, preds, average='micro', zero_division=0),
-        "f1_macro": f1_score(labels_valid, preds, average='macro', zero_division=0),
-        "f1_samples": f1_score(labels_valid, preds, average='samples', zero_division=0),
-        "precision_micro": precision_score(labels_valid, preds, average='micro', zero_division=0),
-        "recall_micro": recall_score(labels_valid, preds, average='micro', zero_division=0),
-        "exact_match": float((preds == labels_valid).all(axis=1).mean()),
-    }
-    for c in range(num_labels):
-        result[f"f1_label{c}"] = f1_score(labels_valid[:, c], preds[:, c], zero_division=0)
-        result[f"recall_label{c}"] = recall_score(labels_valid[:, c], preds[:, c], zero_division=0)
-        result[f"precision_label{c}"] = precision_score(labels_valid[:, c], preds[:, c], zero_division=0)
-
-    return result
+    return compute_binary_metrics(labels_valid.reshape(-1), preds.reshape(-1), probs.reshape(-1))
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +571,13 @@ def main():
     val_dataset = dataset_prepare(val_set, tokenizer, args.num_labels)
 
     train_args = train_args_prepare(args)
+    save_training_args(args, train_args.output_dir)
+    callbacks = []
+    if args.early_stopping_patience and args.early_stopping_patience > 0:
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_threshold=args.early_stopping_threshold,
+        ))
 
     trainer = MultilabelTrainer(
         model=model,
@@ -439,6 +591,7 @@ def main():
         pos_weight=pos_weight,
         focal_gamma=args.focal_gamma,
         num_labels=args.num_labels,
+        callbacks=callbacks,
     )
 
     print('Begin training...')
@@ -446,6 +599,8 @@ def main():
 
     if trainer.is_world_process_zero():
         trainer.save_model(os.path.join(train_args.output_dir, 'best_model'))
+        trainer.save_state()
+        save_best_model_info(trainer, train_args.output_dir)
 
 
 if __name__ == '__main__':
