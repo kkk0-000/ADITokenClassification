@@ -119,8 +119,8 @@ def find_training_args_file(model_name, resolved_model_name):
     return None
 
 
-def build_result_payload(model_name, resolved_model_name, training_args_file, training_args, protein_metrics, token_metrics):
-    payload = {
+def build_result_metadata(model_name, resolved_model_name, training_args_file, training_args, protein_metrics, token_metrics):
+    return {
         'model_name': model_name,
         'resolved_model_name': resolved_model_name,
         'training_args_file': training_args_file,
@@ -241,13 +241,15 @@ def main():
         mtx.write('\n')
         mtx.write('\n')
 
-    test_results_payload = build_result_payload(args.model_name, resolved_model_name, training_args_file, training_args, test_metrics, test_metrics_tok)
+    test_results_metadata = build_result_metadata(args.model_name, resolved_model_name, training_args_file, training_args, test_metrics, test_metrics_tok)
     with open(os.path.join(args.outdir, 'test_results.json'), 'w', encoding='utf-8') as f:
-        json.dump(test_results_payload, f, indent=2, ensure_ascii=False)
+        json.dump(test_metrics_tok, f, indent=2, ensure_ascii=False)
     with open(os.path.join(args.outdir, 'protein_level_test_results.json'), 'w', encoding='utf-8') as f:
         json.dump(test_metrics, f, indent=2, ensure_ascii=False)
     with open(os.path.join(args.outdir, 'token_level_test_results.json'), 'w', encoding='utf-8') as f:
         json.dump(test_metrics_tok, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(args.outdir, 'test_results_metadata.json'), 'w', encoding='utf-8') as f:
+        json.dump(test_results_metadata, f, indent=2, ensure_ascii=False)
     print('Saved evaluation summary to: %s' % os.path.join(args.outdir, 'test_results.json'))
     
             

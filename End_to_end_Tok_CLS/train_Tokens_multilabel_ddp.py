@@ -17,7 +17,7 @@ import json
 import argparse
 import random
 import numpy as np
-from sklearn.metrics import average_precision_score, f1_score, matthews_corrcoef, precision_score, recall_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, matthews_corrcoef, precision_score, recall_score, roc_auc_score
 import pandas as pd
 import torch
 import datasets
@@ -34,6 +34,7 @@ os.environ['NCCL_IB_DISABLE'] = '1'
 
 TRAINING_HISTORY_FILENAME = 'training_history.json'
 TRAINING_SUMMARY_FILENAME = 'training_summary.json'
+METRIC_KEYS = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'mcc', 'specificity', 'tp', 'tn', 'fp', 'fn']
 
 
 # ---------------------------------------------------------------------------
@@ -283,21 +284,29 @@ def compute_pos_weights(dataset_obj, num_labels):
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def safe_average_precision(labels, probs):
+def safe_roc_auc(labels, probs):
     try:
-        return average_precision_score(labels, probs, average='macro')
+        return roc_auc_score(labels, probs)
     except ValueError:
         return 0.0
 
 
-def safe_mcc(labels, preds):
-    scores = []
-    for c in range(labels.shape[1]):
-        if len(np.unique(labels[:, c])) < 2 or len(np.unique(preds[:, c])) < 2:
-            scores.append(0.0)
-        else:
-            scores.append(matthews_corrcoef(labels[:, c], preds[:, c]))
-    return float(np.mean(scores)) if scores else 0.0
+def compute_binary_metrics(labels, preds, probs):
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    return {
+        'accuracy': accuracy_score(labels, preds),
+        'precision': precision_score(labels, preds, zero_division=0),
+        'recall': recall_score(labels, preds, zero_division=0),
+        'f1': f1_score(labels, preds, zero_division=0),
+        'auc': safe_roc_auc(labels, probs),
+        'mcc': matthews_corrcoef(labels, preds) if len(np.unique(labels)) > 1 and len(np.unique(preds)) > 1 else 0.0,
+        'specificity': specificity,
+        'tp': int(tp),
+        'tn': int(tn),
+        'fp': int(fp),
+        'fn': int(fn),
+    }
 
 
 def save_best_model_info(trainer, output_dir):
@@ -345,16 +354,12 @@ def save_training_args(args, output_dir):
 
 
 def extract_metric_payload(metrics, prefix):
-    prefix_key = f'{prefix}_'
-    excluded_suffixes = {'loss', 'runtime', 'samples_per_second', 'steps_per_second', 'jit_compilation_time'}
     payload = {}
-    for key, value in metrics.items():
-        if not key.startswith(prefix_key):
-            continue
-        suffix = key[len(prefix_key):]
-        if suffix in excluded_suffixes:
-            continue
-        payload[suffix] = to_serializable_value(value)
+    for suffix in METRIC_KEYS:
+        metric_key = f'{prefix}_{suffix}'
+        if metric_key in metrics:
+            value = metrics[metric_key]
+            payload[suffix] = int(value) if suffix in {'tp', 'tn', 'fp', 'fn'} else to_serializable_value(value)
     return payload
 
 
@@ -375,7 +380,7 @@ def find_latest_training_loss(log_history):
 def save_training_summary(output_dir, history):
     if not history:
         return None
-    best_entry = max(history, key=lambda item: item['val_metrics'].get('f1_macro', 0.0))
+    best_entry = max(history, key=lambda item: item['val_metrics'].get('f1', 0.0))
     summary = {
         'num_epochs': len(history),
         'best_epoch': best_entry['epoch'],
@@ -479,7 +484,7 @@ def train_args_prepare(args):
         num_train_epochs=args.epochs,
         weight_decay=args.weight_decay,
         load_best_model_at_end=True,
-        metric_for_best_model='f1_macro',
+        metric_for_best_model='f1',
         greater_is_better=True,
         fp16=args.fp16, bf16=args.bf16,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -508,23 +513,7 @@ def compute_metrics(eval_pred):
 
     probs = 1 / (1 + np.exp(-logits_valid))
     preds = (probs > THRESHOLD).astype(int)
-
-    result = {
-        "f1_micro": f1_score(labels_valid, preds, average='micro', zero_division=0),
-        "f1_macro": f1_score(labels_valid, preds, average='macro', zero_division=0),
-        "f1_samples": f1_score(labels_valid, preds, average='samples', zero_division=0),
-        "precision_micro": precision_score(labels_valid, preds, average='micro', zero_division=0),
-        "recall_micro": recall_score(labels_valid, preds, average='micro', zero_division=0),
-        "average_precision_macro": safe_average_precision(labels_valid, probs),
-        "mcc_macro": safe_mcc(labels_valid, preds),
-        "exact_match": float((preds == labels_valid).all(axis=1).mean()),
-    }
-    for c in range(num_labels):
-        result[f"f1_label{c}"] = f1_score(labels_valid[:, c], preds[:, c], zero_division=0)
-        result[f"recall_label{c}"] = recall_score(labels_valid[:, c], preds[:, c], zero_division=0)
-        result[f"precision_label{c}"] = precision_score(labels_valid[:, c], preds[:, c], zero_division=0)
-
-    return result
+    return compute_binary_metrics(labels_valid.reshape(-1), preds.reshape(-1), probs.reshape(-1))
 
 
 # ---------------------------------------------------------------------------
