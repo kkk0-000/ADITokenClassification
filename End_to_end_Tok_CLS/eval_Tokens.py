@@ -128,6 +128,8 @@ def build_result_metadata(model_name, resolved_model_name, training_args_file, t
         'protein_level': protein_metrics,
         'token_level': token_metrics,
     }
+    payload.update(token_metrics)
+    return payload
 
 def resolve_model_path(model_name):
     if os.path.isfile(model_name) and model_name.endswith('.json'):
