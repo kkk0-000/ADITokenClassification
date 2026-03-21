@@ -13,10 +13,11 @@ Launch examples:
 """
 
 import os, sys, re
+import json
 import argparse
 import random
 import numpy as np
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics import average_precision_score, f1_score, matthews_corrcoef, precision_score, recall_score
 import pandas as pd
 import torch
 import datasets
@@ -25,7 +26,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset
 from transformers import EsmForTokenClassification
-from transformers import AutoTokenizer, TrainingArguments, Trainer
+from transformers import AutoTokenizer, EarlyStoppingCallback, TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
 
 os.environ['NCCL_P2P_DISABLE'] = '1'
@@ -241,6 +242,41 @@ def compute_pos_weights(dataset_obj, num_labels):
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def safe_average_precision(labels, probs):
+    try:
+        return average_precision_score(labels, probs, average='macro')
+    except ValueError:
+        return 0.0
+
+
+def safe_mcc(labels, preds):
+    scores = []
+    for c in range(labels.shape[1]):
+        if len(np.unique(labels[:, c])) < 2 or len(np.unique(preds[:, c])) < 2:
+            scores.append(0.0)
+        else:
+            scores.append(matthews_corrcoef(labels[:, c], preds[:, c]))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def save_best_model_info(trainer, output_dir):
+    best_model_info = {
+        'output_dir': output_dir,
+        'best_model_checkpoint': trainer.state.best_model_checkpoint,
+        'best_metric': trainer.state.best_metric,
+        'best_global_step': trainer.state.global_step,
+        'num_train_epochs': trainer.args.num_train_epochs,
+        'per_device_train_batch_size': trainer.args.per_device_train_batch_size,
+        'gradient_accumulation_steps': trainer.args.gradient_accumulation_steps,
+        'world_size': trainer.args.world_size,
+        'process_index': trainer.args.process_index,
+    }
+    best_model_info_path = os.path.join(output_dir, 'best_model_info.json')
+    with open(best_model_info_path, 'w', encoding='utf-8') as f:
+        json.dump(best_model_info, f, indent=2, ensure_ascii=False)
+    print(f'Saved best model information to: {best_model_info_path}')
+
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
@@ -278,6 +314,12 @@ def get_parameters():
     parser.add_argument('--dataloader_num_workers', type=int, default=4)
     parser.add_argument('--logging_steps', type=int, default=50)
     parser.add_argument('--save_total_limit', type=int, default=3)
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Optional explicit output directory for checkpoints/logs.')
+    parser.add_argument('--early_stopping_patience', type=int, default=0,
+                        help='Early stopping patience in evaluation rounds. Set 0 to disable.')
+    parser.add_argument('--early_stopping_threshold', type=float, default=0.0,
+                        help='Minimum improvement required by early stopping.')
     parser.add_argument('--deepspeed', type=str, default=None)
     parser.add_argument('--local_rank', type=int, default=-1)
     args = parser.parse_args()
@@ -313,6 +355,8 @@ def train_args_prepare(args):
     if args.ft_mode == 'lora':
         folder_name = (f"finetune/{mod_name}-lora-r{args.lora_rank}-Token-multilabel-{args.num_labels}"
                        f"-{args.loss_type}-gamma{args.focal_gamma}-ddp")
+    if args.output_dir:
+        folder_name = args.output_dir
     return TrainingArguments(
         output_dir=folder_name,
         overwrite_output_dir=True,
@@ -361,6 +405,8 @@ def compute_metrics(eval_pred):
         "f1_samples": f1_score(labels_valid, preds, average='samples', zero_division=0),
         "precision_micro": precision_score(labels_valid, preds, average='micro', zero_division=0),
         "recall_micro": recall_score(labels_valid, preds, average='micro', zero_division=0),
+        "average_precision_macro": safe_average_precision(labels_valid, probs),
+        "mcc_macro": safe_mcc(labels_valid, preds),
         "exact_match": float((preds == labels_valid).all(axis=1).mean()),
     }
     for c in range(num_labels):
@@ -426,6 +472,12 @@ def main():
     val_dataset = dataset_prepare(val_set, tokenizer, args.num_labels)
 
     train_args = train_args_prepare(args)
+    callbacks = []
+    if args.early_stopping_patience and args.early_stopping_patience > 0:
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_threshold=args.early_stopping_threshold,
+        ))
 
     trainer = MultilabelTrainer(
         model=model,
@@ -439,6 +491,7 @@ def main():
         pos_weight=pos_weight,
         focal_gamma=args.focal_gamma,
         num_labels=args.num_labels,
+        callbacks=callbacks,
     )
 
     print('Begin training...')
@@ -446,6 +499,8 @@ def main():
 
     if trainer.is_world_process_zero():
         trainer.save_model(os.path.join(train_args.output_dir, 'best_model'))
+        trainer.save_state()
+        save_best_model_info(trainer, train_args.output_dir)
 
 
 if __name__ == '__main__':
