@@ -149,7 +149,7 @@ def train_args_prepare(model_name, learning_rate, batch_size, num_train_epochs, 
 
 TRAINING_HISTORY_FILENAME = 'training_history.json'
 TRAINING_SUMMARY_FILENAME = 'training_summary.json'
-METRIC_KEYS = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'roc_auc', 'mcc', 'specificity', 'tp', 'tn', 'fp', 'fn']
+METRIC_KEYS = ['accuracy', 'precision', 'recall', 'f1', 'auc', 'mcc', 'specificity', 'tp', 'tn', 'fp', 'fn']
 
 
 def safe_roc_auc_score(labels, probs):
@@ -238,6 +238,14 @@ def to_serializable_float(value):
     return float(value)
 
 
+def to_serializable_epoch(value):
+    if value is None:
+        return None
+    if abs(float(value) - round(float(value))) < 1e-9:
+        return int(round(float(value)))
+    return float(value)
+
+
 def simplify_prefixed_metrics(metrics, prefix):
     simplified = {}
     for key in METRIC_KEYS:
@@ -308,7 +316,7 @@ class StatisticsTrainer(Trainer):
 
     def _record_training_history(self, eval_metrics, train_metrics):
         history_entry = {
-            'epoch': to_serializable_float(find_latest_epoch(self.state.log_history) or self.state.epoch),
+            'epoch': to_serializable_epoch(find_latest_epoch(self.state.log_history) or self.state.epoch),
             'train_loss': to_serializable_float(train_metrics.get('train_loss', find_latest_training_loss(self.state.log_history))),
             'val_loss': to_serializable_float(eval_metrics.get('eval_loss')),
             'train_metrics': simplify_prefixed_metrics(train_metrics, 'train'),
