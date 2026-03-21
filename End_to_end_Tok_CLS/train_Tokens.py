@@ -267,6 +267,14 @@ def save_json_file(output_path, payload):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def save_training_args(args, output_dir):
+    training_args_payload = vars(args).copy()
+    training_args_payload['output_dir'] = output_dir
+    training_args_path = os.path.join(output_dir, 'training_args.json')
+    save_json_file(training_args_path, training_args_payload)
+    return training_args_path
+
+
 def save_training_summary(output_dir, history):
     if not history:
         return None
@@ -428,6 +436,7 @@ def save_best_model_info(trainer, best_model_info_name='best_model_info.json'):
         'eval_strategy': str(trainer.args.eval_strategy),
         'early_stopping_patience': next((cb.early_stopping_patience for cb in trainer.callback_handler.callbacks if hasattr(cb, 'early_stopping_patience')), 0),
         'early_stopping_threshold': next((cb.early_stopping_threshold for cb in trainer.callback_handler.callbacks if hasattr(cb, 'early_stopping_threshold')), 0.0),
+        'training_args_file': os.path.join(output_dir, 'training_args.json'),
         'training_history_file': os.path.join(output_dir, TRAINING_HISTORY_FILENAME),
         'training_summary_file': os.path.join(output_dir, TRAINING_SUMMARY_FILENAME),
         'log_history': trainer.state.log_history,
@@ -489,6 +498,7 @@ def run_training_with_best_model_tracking(args):
                                  compute_metrics=compute_metrics,
                                  early_stopping_patience=args.early_stopping_patience,
                                  early_stopping_threshold=args.early_stopping_threshold)
+    save_training_args(args, train_args.output_dir)
 
     print('Begin training...')
     trainer.train()

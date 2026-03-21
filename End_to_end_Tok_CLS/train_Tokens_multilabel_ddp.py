@@ -32,6 +32,9 @@ from peft import get_peft_model, LoraConfig, TaskType
 os.environ['NCCL_P2P_DISABLE'] = '1'
 os.environ['NCCL_IB_DISABLE'] = '1'
 
+TRAINING_HISTORY_FILENAME = 'training_history.json'
+TRAINING_SUMMARY_FILENAME = 'training_summary.json'
+
 
 # ---------------------------------------------------------------------------
 # Multi-label Focal Loss (per-element binary focal loss)
@@ -105,6 +108,8 @@ class MultilabelTrainer(Trainer):
         self.pos_weight = pos_weight
         self.focal_gamma = focal_gamma
         self.num_labels = num_labels
+        self.training_history = []
+        self._collecting_train_statistics = False
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")  # (batch, seq_len, num_labels)
@@ -135,6 +140,42 @@ class MultilabelTrainer(Trainer):
             loss = F.binary_cross_entropy_with_logits(logits_valid, labels_valid)
 
         return (loss, outputs) if return_outputs else loss
+
+    def _evaluate_train_split(self, ignore_keys=None):
+        self._collecting_train_statistics = True
+        try:
+            return super().evaluate(
+                eval_dataset=self.train_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix='train',
+            )
+        finally:
+            self._collecting_train_statistics = False
+
+    def _record_training_history(self, eval_metrics, train_metrics):
+        history_entry = {
+            'epoch': find_latest_epoch(self.state.log_history, default_epoch=self.state.epoch),
+            'train_loss': to_serializable_value(train_metrics.get('train_loss', find_latest_training_loss(self.state.log_history))),
+            'train_metrics': extract_metric_payload(train_metrics, 'train'),
+            'val_loss': to_serializable_value(eval_metrics.get('eval_loss')),
+            'val_metrics': extract_metric_payload(eval_metrics, 'eval'),
+        }
+        self.training_history.append(history_entry)
+        if self.is_world_process_zero():
+            save_json_file(os.path.join(self.args.output_dir, TRAINING_HISTORY_FILENAME), self.training_history)
+            save_training_summary(self.args.output_dir, self.training_history)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix='eval'):
+        metrics = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+        should_collect_history = (
+            metric_key_prefix == 'eval'
+            and not self._collecting_train_statistics
+            and self.train_dataset is not None
+        )
+        if should_collect_history:
+            train_metrics = self._evaluate_train_split(ignore_keys=ignore_keys)
+            self._record_training_history(metrics, train_metrics)
+        return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +311,80 @@ def save_best_model_info(trainer, output_dir):
         'gradient_accumulation_steps': trainer.args.gradient_accumulation_steps,
         'world_size': trainer.args.world_size,
         'process_index': trainer.args.process_index,
+        'training_args_file': os.path.join(output_dir, 'training_args.json'),
+        'training_history_file': os.path.join(output_dir, TRAINING_HISTORY_FILENAME),
+        'training_summary_file': os.path.join(output_dir, TRAINING_SUMMARY_FILENAME),
     }
     best_model_info_path = os.path.join(output_dir, 'best_model_info.json')
     with open(best_model_info_path, 'w', encoding='utf-8') as f:
         json.dump(best_model_info, f, indent=2, ensure_ascii=False)
     print(f'Saved best model information to: {best_model_info_path}')
+
+
+def to_serializable_value(value):
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        if abs(value - round(value)) < 1e-9:
+            return int(round(value))
+        return float(value)
+    return value
+
+
+def save_json_file(output_path, payload):
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def save_training_args(args, output_dir):
+    training_args_payload = vars(args).copy()
+    training_args_payload['output_dir'] = output_dir
+    training_args_path = os.path.join(output_dir, 'training_args.json')
+    save_json_file(training_args_path, training_args_payload)
+    return training_args_path
+
+
+def extract_metric_payload(metrics, prefix):
+    prefix_key = f'{prefix}_'
+    excluded_suffixes = {'loss', 'runtime', 'samples_per_second', 'steps_per_second', 'jit_compilation_time'}
+    payload = {}
+    for key, value in metrics.items():
+        if not key.startswith(prefix_key):
+            continue
+        suffix = key[len(prefix_key):]
+        if suffix in excluded_suffixes:
+            continue
+        payload[suffix] = to_serializable_value(value)
+    return payload
+
+
+def find_latest_epoch(log_history, default_epoch=None):
+    for entry in reversed(log_history):
+        if 'epoch' in entry:
+            return to_serializable_value(entry['epoch'])
+    return to_serializable_value(default_epoch)
+
+
+def find_latest_training_loss(log_history):
+    for entry in reversed(log_history):
+        if 'loss' in entry:
+            return float(entry['loss'])
+    return None
+
+
+def save_training_summary(output_dir, history):
+    if not history:
+        return None
+    best_entry = max(history, key=lambda item: item['val_metrics'].get('f1_macro', 0.0))
+    summary = {
+        'num_epochs': len(history),
+        'best_epoch': best_entry['epoch'],
+        'best_train_loss': best_entry['train_loss'],
+        'best_val_loss': best_entry['val_loss'],
+        'best_val_metrics': best_entry['val_metrics'],
+    }
+    save_json_file(os.path.join(output_dir, TRAINING_SUMMARY_FILENAME), summary)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +582,7 @@ def main():
     val_dataset = dataset_prepare(val_set, tokenizer, args.num_labels)
 
     train_args = train_args_prepare(args)
+    save_training_args(args, train_args.output_dir)
     callbacks = []
     if args.early_stopping_patience and args.early_stopping_patience > 0:
         callbacks.append(EarlyStoppingCallback(

@@ -90,9 +90,41 @@ def compute_metrics(preds, labs, probs=None):
     return compute_binary_metrics(labs, preds, probs=probs)
 
 
-def build_result_payload(model_name, protein_metrics, token_metrics):
+def load_json_if_exists(path):
+    if path and os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+def find_training_args_file(model_name, resolved_model_name):
+    candidates = []
+    for candidate in [model_name, resolved_model_name]:
+        if not candidate:
+            continue
+        if os.path.isfile(candidate):
+            candidates.append(os.path.join(os.path.dirname(candidate), 'training_args.json'))
+        if os.path.isdir(candidate):
+            candidates.append(os.path.join(candidate, 'training_args.json'))
+            candidates.append(os.path.join(os.path.dirname(candidate.rstrip('/')), 'training_args.json'))
+            best_model_info_path = os.path.join(candidate, 'best_model_info.json')
+            if os.path.exists(best_model_info_path):
+                best_model_info = load_json_if_exists(best_model_info_path)
+                if best_model_info is not None:
+                    candidates.append(best_model_info.get('training_args_file'))
+                    candidates.append(os.path.join(best_model_info.get('output_dir', candidate), 'training_args.json'))
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def build_result_payload(model_name, resolved_model_name, training_args_file, training_args, protein_metrics, token_metrics):
     payload = {
         'model_name': model_name,
+        'resolved_model_name': resolved_model_name,
+        'training_args_file': training_args_file,
+        'training_args': training_args,
         'protein_level': protein_metrics,
         'token_level': token_metrics,
     }
@@ -185,6 +217,8 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
     resolved_model_name = resolve_model_path(args.model_name)
+    training_args_file = find_training_args_file(args.model_name, resolved_model_name)
+    training_args = load_json_if_exists(training_args_file)
     with open(os.path.join(args.outdir, 'eval_metrics.txt'), 'a') as mtx:
         mtx.write('Evaluation on model: %s\n' % os.path.basename(resolved_model_name.rstrip('/')))
         ## val dataset
@@ -207,7 +241,7 @@ def main():
         mtx.write('\n')
         mtx.write('\n')
 
-    test_results_payload = build_result_payload(resolved_model_name, test_metrics, test_metrics_tok)
+    test_results_payload = build_result_payload(args.model_name, resolved_model_name, training_args_file, training_args, test_metrics, test_metrics_tok)
     with open(os.path.join(args.outdir, 'test_results.json'), 'w', encoding='utf-8') as f:
         json.dump(test_results_payload, f, indent=2, ensure_ascii=False)
     with open(os.path.join(args.outdir, 'protein_level_test_results.json'), 'w', encoding='utf-8') as f:
