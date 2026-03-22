@@ -27,7 +27,6 @@ from transformers.utils.generic import ModelOutput
 from dataclasses import dataclass
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-from transformers import TrainerCallback
 from sklearn.metrics import matthews_corrcoef
 
 os.environ['NCCL_P2P_DISABLE'] = '1'
@@ -109,6 +108,8 @@ def get_parameters():
                         help='use bf16 mixed precision')
     parser.add_argument('--ddp_find_unused_parameters', type=lambda x: str(x).lower() == 'true', default=False,
                         help='DDP find_unused_parameters')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for torchrun/DistributedDataParallel compatibility')
     # parser.add_argument('--cuda', type=int, default=0, help='CUDA number (default: 0). ["None",0,1,2,3].')
     # parser.add_argument('--alpha', type=float, default=1.0, help='Weight for CE loss (default 1.0)')
     # parser.add_argument('--beta', type=float, default=1.0, help='Weight for focal loss (default 1.0)')
@@ -386,8 +387,6 @@ class TrainerWithMixedLoss(Trainer):
         focal_alpha=0.25,
         focal_gamma=2.0,
         loss_function='ce',
-        history_recorder=None,
-        train_dataset_for_metrics=None,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -396,11 +395,8 @@ class TrainerWithMixedLoss(Trainer):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.loss_function = loss_function
-
-        # 新增：每个epoch记录器
-        self.history_recorder = history_recorder
-        self.train_dataset_for_metrics = train_dataset_for_metrics
-        self._recorded_eval_steps = set()  # 防止同一步重复记录
+        self.training_history = []
+        self._collecting_train_statistics = False
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
@@ -441,6 +437,88 @@ class TrainerWithMixedLoss(Trainer):
                 if "loss" in row and not any(k.startswith("eval_") for k in row.keys()):
                     last_loss = row["loss"]
         return last_loss
+
+
+    def _evaluate_train_split(self, ignore_keys=None):
+        self._collecting_train_statistics = True
+        try:
+            return super().evaluate(
+                eval_dataset=self.train_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix="train",
+            )
+        finally:
+            self._collecting_train_statistics = False
+
+    def _epoch_value(self):
+        epoch = self.state.epoch
+        if epoch is None:
+            return len(self.training_history) + 1
+        epoch = float(epoch)
+        return int(epoch) if epoch.is_integer() else epoch
+
+    def _history_path(self):
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        return os.path.join(self.args.output_dir, "train_history.json")
+
+    def _save_training_history(self):
+        if self.is_world_process_zero():
+            history_by_epoch = {entry["epoch"]: entry for entry in self.training_history}
+            max_epochs = int(self.args.num_train_epochs)
+            serialized_history = []
+            for epoch in range(1, max_epochs + 1):
+                serialized_history.append(history_by_epoch.get(epoch, {
+                    "epoch": epoch,
+                    "train_loss": None,
+                    "train_metrics": None,
+                    "val_loss": None,
+                    "val_metrics": None,
+                }))
+            with open(self._history_path(), "w", encoding="utf-8") as f:
+                json.dump(serialized_history, f, indent=2, ensure_ascii=False)
+
+    def _record_training_history(self, eval_metrics, train_metrics):
+        epoch_value = self._epoch_value()
+        train_loss = self._find_train_loss_for_epoch(epoch_value) if isinstance(epoch_value, int) else None
+        if train_loss is None:
+            train_loss = train_metrics.get("train_loss")
+
+        history_entry = {
+            "epoch": epoch_value,
+            "train_loss": train_loss,
+            "train_metrics": extract_core_metrics(train_metrics, "train"),
+            "val_loss": eval_metrics.get("eval_loss"),
+            "val_metrics": extract_core_metrics(eval_metrics, "eval"),
+        }
+
+        epoch_key = history_entry["epoch"]
+        replaced = False
+        for idx, entry in enumerate(self.training_history):
+            if entry.get("epoch") == epoch_key:
+                self.training_history[idx] = history_entry
+                replaced = True
+                break
+        if not replaced:
+            self.training_history.append(history_entry)
+            self.training_history.sort(key=lambda item: item["epoch"])
+
+        self._save_training_history()
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        should_collect_history = (
+            metric_key_prefix == "eval"
+            and not self._collecting_train_statistics
+            and self.train_dataset is not None
+        )
+        if should_collect_history:
+            train_metrics = self._evaluate_train_split(ignore_keys=ignore_keys)
+            self._record_training_history(metrics, train_metrics)
+        return metrics
 
 
 def extract_core_metrics(metrics_dict, prefix):
@@ -609,84 +687,8 @@ def trainer_prepare(model, train_args, train_dataset, test_dataset, tokenizer, d
 #     def on_train_end(self, args, state, control, **kwargs):
 #         if state.is_world_process_zero:
 #             self._save()
-import os
-import json
 
-class EpochHistoryCallback(TrainerCallback):
-    def __init__(self, output_dir, total_epochs, filename="train_history.json"):
-        self.output_dir = output_dir
-        self.total_epochs = int(total_epochs)
-        self.filename = filename
 
-    def _path(self):
-        os.makedirs(self.output_dir, exist_ok=True)
-        return os.path.join(self.output_dir, self.filename)
-
-    def _extract_from_log_history(self, log_history):
-        epoch_map = {}
-
-        for row in log_history:
-            if "epoch" not in row:
-                continue
-            epf = float(row["epoch"])
-            if not epf.is_integer():
-                continue
-            ep = int(epf)
-
-            if ep not in epoch_map:
-                epoch_map[ep] = {
-                    "epoch": ep,
-                    "train_loss": None,
-                    "train_metrics": None,
-                    "val_loss": None,
-                    "val_metrics": None
-                }
-
-            # train
-            if "loss" in row and not any(k.startswith("eval_") for k in row.keys()):
-                epoch_map[ep]["train_loss"] = row.get("loss")
-
-            # eval
-            if "eval_loss" in row:
-                epoch_map[ep]["val_loss"] = row.get("eval_loss")
-                epoch_map[ep]["val_metrics"] = {
-                    "accuracy": row.get("eval_accuracy"),
-                    "precision": row.get("eval_precision"),
-                    "recall": row.get("eval_recall"),
-                    "f1": row.get("eval_f1"),
-                    "auc": row.get("eval_auc"),
-                    "mcc": row.get("eval_mcc"),
-                    "specificity": row.get("eval_specificity"),
-                    "tp": row.get("eval_tp"),
-                    "tn": row.get("eval_tn"),
-                    "fp": row.get("eval_fp"),
-                    "fn": row.get("eval_fn"),
-                }
-
-        # 补全 1..total_epochs
-        data = []
-        for ep in range(1, self.total_epochs + 1):
-            data.append(epoch_map.get(ep, {
-                "epoch": ep,
-                "train_loss": None,
-                "train_metrics": None,
-                "val_loss": None,
-                "val_metrics": None
-            }))
-        return data
-
-    def _save(self, state):
-        data = self._extract_from_log_history(state.log_history)
-        with open(self._path(), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if state.is_world_process_zero:
-            self._save(state)
-
-    def on_train_end(self, args, state, control, **kwargs):
-        if state.is_world_process_zero:
-            self._save(state)
 
 
 # class EpochHistoryRecorder:
@@ -782,13 +784,6 @@ def main():
         loss_function=args.loss_function,
         outdir=train_args.output_dir
     )
-    cb = EpochHistoryCallback(
-        output_dir=train_args.output_dir,
-        total_epochs=int(train_args.num_train_epochs)
-    )
-    trainer.add_callback(cb)
-
-
     print('Begin training...')
     trainer.train() 
     # 保存 best_model
